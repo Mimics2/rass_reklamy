@@ -1,285 +1,436 @@
 import asyncio
 import logging
-from datetime import datetime, time, timedelta
-from typing import List
-import pytz
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+import pandas as pd
+import os
+from datetime import datetime
+import random
+import sqlite3
+from io import BytesIO
 
 # Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Данные вашего аккаунта
-API_ID = 34926321
-API_HASH = '3ce3de5ab33d2defac471e34d47662e2'
-PHONE_NUMBER = '+79123456789'  # Ваш номер телефона с кодом страны
+# Глобальные переменные
+user_sessions = {}
+user_states = {}
+user_data = {}
 
-class BaroHologSender:
-    def __init__(self, api_id: int, api_hash: str):
-        self.client = TelegramClient('baroholog_session', api_id, api_hash)
-        self.chats_list = []  # Будем хранить объекты чатов
-        self.is_active = False
-        self.scheduled_tasks = []
+class MassSenderBot:
+    def __init__(self, bot_token):
+        self.bot_token = bot_token
+        self.bot = None
         
-    def setup_handlers(self):
-        """Настройка обработчиков команд"""
-        self.client.on(events.NewMessage(pattern='/start'))(self.start_command)
-        self.client.on(events.NewMessage(pattern='/add_chats'))(self.add_chats_command)
-        self.client.on(events.NewMessage(pattern='/start_bot'))(self.start_bot_command)
-        self.client.on(events.NewMessage(pattern='/status'))(self.status_command)
-        self.client.on(events.NewMessage(pattern='/stop_bot'))(self.stop_bot_command)
-    
-    async def start_command(self, event):
-        """Обработчик команды /start"""
-        if not await self.is_owner(event):
-            return
-            
-        instructions = """
-🤖 **Рассылка рекламных сообщений BaroHolog**
-
-**Доступные команды:**
-
-📝 `/add_chats` - Добавить чаты для рассылки (ответьте на сообщение из чата)
-▶️ `/start_bot` - Запуск автоматической рассылки
-🛑 `/stop_bot` - Остановить рассылку
-📊 `/status` - Проверить статус
-🆘 `/start` - Показать инструкцию
-
-**Расписание рассылки:**
-⏰ 09:00 по Москве - первая публикация
-⏰ 17:00 по Москве - вторая публикация
-
-**Важно:** Строго 2 публикации в день в указанное время.
-        """
-        await event.reply(instructions)
-    
-    async def add_chats_command(self, event):
-        """Обработчик команды /add_chats"""
-        if not await self.is_owner(event):
-            return
+    async def start(self):
+        """Запуск бота"""
+        self.bot = TelegramClient('bot_session', api_id, api_hash).start(bot_token=self.bot_token)
         
-        if event.is_reply:
-            reply_msg = await event.get_reply_message()
-            chat = await event.get_chat()
+        # Регистрация обработчиков
+        self.register_handlers()
+        
+        print("🤖 Бот запущен!")
+        await self.bot.run_until_disconnected()
+    
+    def register_handlers(self):
+        """Регистрация обработчиков событий"""
+        
+        @self.bot.on(events.NewMessage(pattern='/start'))
+        async def start_handler(event):
+            """Обработчик команды /start"""
+            user_id = event.sender_id
+            user_states[user_id] = 'main_menu'
             
-            chat_info = {
-                'id': chat.id,
-                'title': getattr(chat, 'title', 'Private Chat'),
-                'username': getattr(chat, 'username', None),
-                'entity': chat
-            }
-            
-            if not any(c['id'] == chat_info['id'] for c in self.chats_list):
-                self.chats_list.append(chat_info)
-                await event.reply(
-                    f"✅ Чат добавлен: {chat_info['title']}\n"
-                    f"📊 Всего чатов: {len(self.chats_list)}"
-                )
-            else:
-                await event.reply("❌ Этот чат уже добавлен")
-        else:
-            await event.reply(
-                "📝 **Добавление чатов**\n\n"
-                "Чтобы добавить чат:\n"
-                "1. Перейдите в нужный чат/группу\n"
-                "2. Ответьте на любое сообщение командой `/add_chats`\n\n"
-                "Или перешлите сообщение из чата с командой `/add_chats`"
+            await event.respond(
+                "🤖 **Бот для массовой рассылки в Telegram**\n\n"
+                "Доступные команды:\n"
+                "/setup - Настройка аккаунта для рассылки\n"
+                "/scrape - Сбор пользователей из чата/канала\n"
+                "/draft - Создание черновика сообщения\n"
+                "/send - Начать рассылку\n"
+                "/stats - Статистика\n"
+                "/help - Помощь"
             )
-    
-    async def start_bot_command(self, event):
-        """Обработчик команды /start_bot"""
-        if not await self.is_owner(event):
-            return
+        
+        @self.bot.on(events.NewMessage(pattern='/setup'))
+        async def setup_handler(event):
+            """Настройка аккаунта"""
+            user_id = event.sender_id
+            user_states[user_id] = 'awaiting_api_id'
             
-        if not self.chats_list:
-            await event.reply("❌ Сначала добавьте чаты с помощью `/add_chats`")
-            return
+            await event.respond(
+                "🔧 **Настройка аккаунта для рассылки**\n\n"
+                "Для начала введите ваш API ID (можно получить на https://my.telegram.org):"
+            )
+        
+        @self.bot.on(events.NewMessage(pattern='/scrape'))
+        async def scrape_handler(event):
+            """Сбор пользователей"""
+            user_id = event.sender_id
             
-        if self.is_active:
-            await event.reply("❌ Рассылка уже активна")
-            return
-        
-        self.is_active = True
-        await self.setup_schedule()
-        
-        chat_names = "\n".join([f"• {chat['title']}" for chat in self.chats_list])
-        
-        await event.reply(
-            f"✅ **Рассылка запущена!**\n\n"
-            f"📊 Чатов для рассылки: {len(self.chats_list)}\n"
-            f"⏰ Расписание: 09:00 и 17:00 по Москве\n"
-            f"📢 Публикаций в день: 2\n\n"
-            f"Чаты:\n{chat_names}"
-        )
-    
-    async def stop_bot_command(self, event):
-        """Остановка рассылки"""
-        if not await self.is_owner(event):
-            return
+            if user_id not in user_sessions:
+                await event.respond("❌ Сначала настройте аккаунт через /setup")
+                return
             
-        if not self.is_active:
-            await event.reply("❌ Рассылка и так не активна")
-            return
+            user_states[user_id] = 'awaiting_chat_link'
+            await event.respond("🔗 Введите ссылку на чат/канал (например: t.me/username или https://t.me/username):")
+        
+        @self.bot.on(events.NewMessage(pattern='/draft'))
+        async def draft_handler(event):
+            """Создание черновика"""
+            user_id = event.sender_id
+            user_states[user_id] = 'awaiting_draft'
             
-        await self.stop_bot()
-        await event.reply("🛑 Рассылка остановлена")
-    
-    async def status_command(self, event):
-        """Обработчик команды /status"""
-        if not await self.is_owner(event):
-            return
+            await event.respond(
+                "📝 **Создание черновика**\n\n"
+                "Введите текст сообщения для рассылки:\n\n"
+                "Поддерживается форматирование:\n"
+                "**жирный** - жирный текст\n"
+                "__курсив__ - курсив\n"
+                "`код` - моноширинный текст\n"
+                "[текст](ссылка) - гиперссылка"
+            )
+        
+        @self.bot.on(events.NewMessage(pattern='/send'))
+        async def send_handler(event):
+            """Начало рассылки"""
+            user_id = event.sender_id
             
-        status_text = "🟢 АКТИВНА" if self.is_active else "🔴 НЕ АКТИВНА"
-        
-        status_message = (
-            f"🤖 **Статус рассылки BaroHolog**\n\n"
-            f"📊 Статус: {status_text}\n"
-            f"👥 Чатов в списке: {len(self.chats_list)}\n"
-            f"📅 Время проверки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        )
-        
-        if self.chats_list:
-            status_message += "\n📋 Список чатов:\n" + "\n".join([f"• {chat['title']}" for chat in self.chats_list[:5]])
-            if len(self.chats_list) > 5:
-                status_message += f"\n... и еще {len(self.chats_list) - 5} чатов"
-        else:
-            status_message += "\n📝 Чаты не добавлены"
+            if user_id not in user_sessions:
+                await event.respond("❌ Сначала настройте аккаунт через /setup")
+                return
             
-        await event.reply(status_message)
-    
-    async def is_owner(self, event):
-        """Проверка, что команда от владельца аккаунта"""
-        sender = await event.get_sender()
-        me = await self.client.get_me()
-        return sender.id == me.id
-    
-    async def setup_schedule(self):
-        """Настройка расписания рассылки"""
-        # Очищаем предыдущие задачи
-        for task in self.scheduled_tasks:
-            task.cancel()
-        self.scheduled_tasks.clear()
-        
-        # Создаем задачи для двух времен
-        times = [time(9, 0), time(17, 0)]  # 09:00 и 17:00 по Москве
-        
-        for send_time in times:
-            task = asyncio.create_task(self.schedule_sender(send_time))
-            self.scheduled_tasks.append(task)
+            if 'drafts' not in user_data.get(user_id, {}) or not user_data[user_id]['drafts']:
+                await event.respond("❌ Сначала создайте черновик через /draft")
+                return
             
-        logger.info(f"Настроено расписание для {len(times)} времен")
-    
-    async def schedule_sender(self, send_time: time):
-        """Планировщик рассылки для конкретного времени"""
-        moscow_tz = pytz.timezone('Europe/Moscow')
+            # Показываем список черновиков
+            drafts = user_data[user_id]['drafts']
+            message = "📋 **Выберите черновик для отправки:**\n\n"
+            for i, draft in enumerate(drafts, 1):
+                message += f"{i}. {draft[:50]}...\n"
+            
+            user_states[user_id] = 'awaiting_draft_selection'
+            await event.respond(message)
         
-        while self.is_active:
+        @self.bot.on(events.NewMessage(pattern='/stats'))
+        async def stats_handler(event):
+            """Статистика"""
+            user_id = event.sender_id
+            
+            if user_id not in user_data:
+                await event.respond("📊 Статистика будет доступна после начала работы")
+                return
+            
+            user_info = user_data[user_id]
+            db_file = f'users_{user_id}.csv'
+            sent_file = f'sent_{user_id}.csv'
+            
+            total_users = 0
+            sent_messages = 0
+            
+            if os.path.exists(db_file):
+                df = pd.read_csv(db_file)
+                total_users = len(df)
+            
+            if os.path.exists(sent_file):
+                df = pd.read_csv(sent_file)
+                sent_messages = len(df)
+            
+            await event.respond(
+                f"📊 **Статистика:**\n\n"
+                f"👥 Пользователей в базе: {total_users}\n"
+                f"📤 Отправлено сообщений: {sent_messages}\n"
+                f"📝 Черновиков: {len(user_info.get('drafts', []))}\n"
+                f"🔧 Аккаунт настроен: {'✅' if user_id in user_sessions else '❌'}"
+            )
+        
+        @self.bot.on(events.NewMessage(pattern='/help'))
+        async def help_handler(event):
+            """Помощь"""
+            await event.respond(
+                "🆘 **Помощь по боту:**\n\n"
+                "1. /setup - Настройте свой аккаунт (API ID и Hash)\n"
+                "2. /scrape - Соберите пользователей из чата\n"
+                "3. /draft - Создайте сообщение для рассылки\n"
+                "4. /send - Запустите рассылку\n\n"
+                "⚠️ **Важно:**\n"
+                "- Соблюдайте лимиты Telegram\n"
+                "- Используйте аккаунт осторожно\n"
+                "- Сохраняйте backup данных"
+            )
+        
+        @self.bot.on(events.NewMessage)
+        async def message_handler(event):
+            """Обработчик всех сообщений"""
+            user_id = event.sender_id
+            text = event.text
+            
+            if user_id not in user_states:
+                user_states[user_id] = 'main_menu'
+                return
+            
+            state = user_states[user_id]
+            
             try:
-                now = datetime.now(moscow_tz)
-                target_time = moscow_tz.localize(datetime.combine(now.date(), send_time))
+                if state == 'awaiting_api_id':
+                    try:
+                        api_id = int(text)
+                        user_data[user_id] = {'api_id': api_id}
+                        user_states[user_id] = 'awaiting_api_hash'
+                        await event.respond("✅ API ID принят. Теперь введите API Hash:")
+                    except ValueError:
+                        await event.respond("❌ Неверный формат API ID. Введите число:")
                 
-                # Если время уже прошло сегодня, планируем на завтра
-                if now > target_time:
-                    target_time += timedelta(days=1)
+                elif state == 'awaiting_api_hash':
+                    user_data[user_id]['api_hash'] = text
+                    user_states[user_id] = 'awaiting_phone'
+                    await event.respond("✅ API Hash принят. Теперь введите номер телефона (в международном формате, например: +79991234567):")
                 
-                wait_seconds = (target_time - now).total_seconds()
-                logger.info(f"Следующая рассылка в {send_time} через {wait_seconds:.0f} секунд")
+                elif state == 'awaiting_phone':
+                    user_data[user_id]['phone'] = text
+                    
+                    # Пытаемся создать клиент
+                    try:
+                        client = TelegramClient(
+                            StringSession(), 
+                            user_data[user_id]['api_id'], 
+                            user_data[user_id]['api_hash']
+                        )
+                        
+                        await client.connect()
+                        
+                        # Отправляем код верификации
+                        sent_code = await client.send_code_request(user_data[user_id]['phone'])
+                        user_data[user_id]['phone_code_hash'] = sent_code.phone_code_hash
+                        user_sessions[user_id] = client
+                        
+                        user_states[user_id] = 'awaiting_code'
+                        await event.respond("📲 Код верификации отправлен. Введите код из Telegram:")
+                    
+                    except Exception as e:
+                        await event.respond(f"❌ Ошибка: {str(e)}")
+                        user_states[user_id] = 'main_menu'
                 
-                # Ждем до времени рассылки
-                await asyncio.sleep(wait_seconds)
+                elif state == 'awaiting_code':
+                    try:
+                        client = user_sessions[user_id]
+                        
+                        # Завершаем вход
+                        await client.sign_in(
+                            phone=user_data[user_id]['phone'],
+                            code=text,
+                            phone_code_hash=user_data[user_id]['phone_code_hash']
+                        )
+                        
+                        user_states[user_id] = 'main_menu'
+                        await event.respond("✅ Аккаунт успешно настроен! Теперь можете использовать /scrape, /draft, /send")
+                    
+                    except Exception as e:
+                        await event.respond(f"❌ Ошибка входа: {str(e)}")
+                        user_states[user_id] = 'main_menu'
                 
-                if self.is_active:
-                    await self.send_messages()
+                elif state == 'awaiting_chat_link':
+                    # Сбор пользователей
+                    await self.scrape_users(event, user_id, text)
                 
-                # Ждем до следующего дня
-                await asyncio.sleep(86400 - wait_seconds)  # Ожидание до следующего дня
+                elif state == 'awaiting_draft':
+                    if user_id not in user_data:
+                        user_data[user_id] = {}
+                    if 'drafts' not in user_data[user_id]:
+                        user_data[user_id]['drafts'] = []
+                    
+                    user_data[user_id]['drafts'].append(text)
+                    user_states[user_id] = 'main_menu'
+                    await event.respond(f"✅ Черновик сохранен! Всего черновиков: {len(user_data[user_id]['drafts'])}")
                 
-            except Exception as e:
-                logger.error(f"Ошибка в планировщике: {e}")
-                await asyncio.sleep(60)
-    
-    async def send_messages(self):
-        """Отправка сообщений во все чаты"""
-        if not self.is_active or not self.chats_list:
-            return
+                elif state == 'awaiting_draft_selection':
+                    try:
+                        draft_index = int(text) - 1
+                        drafts = user_data[user_id]['drafts']
+                        
+                        if 0 <= draft_index < len(drafts):
+                            selected_draft = drafts[draft_index]
+                            user_data[user_id]['selected_draft'] = selected_draft
+                            user_states[user_id] = 'confirm_sending'
+                            
+                            await event.respond(
+                                f"📤 **Подтверждение рассылки**\n\n"
+                                f"Сообщение: {selected_draft[:100]}...\n\n"
+                                f"Продолжить? (да/нет)"
+                            )
+                        else:
+                            await event.respond("❌ Неверный номер черновика")
+                    
+                    except ValueError:
+                        await event.respond("❌ Введите номер черновика")
+                
+                elif state == 'confirm_sending':
+                    if text.lower() in ['да', 'yes', 'y', 'д']:
+                        await self.start_mass_sending(event, user_id)
+                    else:
+                        user_states[user_id] = 'main_menu'
+                        await event.respond("❌ Рассылка отменена")
             
-        logger.info(f"Начало рассылки в {len(self.chats_list)} чатов")
-        
-        success_count = 0
-        fail_count = 0
-        
-        for chat_info in self.chats_list:
-            try:
-                message_text = """
-📢 **Рекламное сообщение BaroHolog** 📢
-
-Ваше рекламное сообщение здесь...
-
-✨ Преимущества:
-• Высокое качество
-• Быстрая доставка  
-• Отличная поддержка
-
-📞 Контакты: ваш контакт
-                """
-                
-                await self.client.send_message(
-                    entity=chat_info['entity'],
-                    message=message_text
-                )
-                success_count += 1
-                logger.info(f"Сообщение отправлено в {chat_info['title']}")
-                
-                # Пауза между отправками
-                await asyncio.sleep(3)
-                
             except Exception as e:
-                fail_count += 1
-                logger.error(f"Ошибка отправки в {chat_info['title']}: {e}")
-        
-        # Отправляем отчет себе
-        report_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        report_message = (
-            f"📊 **Отчет о рассылке**\n\n"
-            f"⏰ Время: {report_time}\n"
-            f"✅ Успешно: {success_count}\n"
-            f"❌ Ошибок: {fail_count}\n"
-            f"📊 Всего чатов: {len(self.chats_list)}"
-        )
-        
+                await event.respond(f"💥 Произошла ошибка: {str(e)}")
+                user_states[user_id] = 'main_menu'
+    
+    async def scrape_users(self, event, user_id, chat_link):
+        """Сбор пользователей из чата"""
         try:
-            me = await self.client.get_me()
-            await self.client.send_message(me.id, report_message)
+            client = user_sessions[user_id]
+            await event.respond("🔄 Начинаем сбор пользователей...")
+            
+            chat = await client.get_entity(chat_link)
+            users_data = []
+            
+            async for user in client.iter_participants(chat, aggressive=True, limit=1000):
+                if user.username and not user.bot:
+                    users_data.append({
+                        'user_id': user.id,
+                        'username': user.username,
+                        'first_name': user.first_name or '',
+                        'last_name': user.last_name or '',
+                        'scraped_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'source_chat': getattr(chat, 'title', 'Unknown')
+                    })
+            
+            # Сохраняем в файл
+            db_file = f'users_{user_id}.csv'
+            df = pd.DataFrame(users_data)
+            
+            if os.path.exists(db_file):
+                existing_df = pd.read_csv(db_file)
+                combined_df = pd.concat([existing_df, df]).drop_duplicates(subset=['user_id'])
+                combined_df.to_csv(db_file, index=False)
+                new_users = len(combined_df) - len(existing_df)
+            else:
+                df.to_csv(db_file, index=False)
+                new_users = len(df)
+            
+            user_states[user_id] = 'main_menu'
+            await event.respond(f"✅ Сбор завершен! Добавлено {new_users} новых пользователей. Всего в базе: {len(pd.read_csv(db_file))}")
+        
         except Exception as e:
-            logger.error(f"Не удалось отправить отчет: {e}")
+            await event.respond(f"❌ Ошибка при сборе пользователей: {str(e)}")
+            user_states[user_id] = 'main_menu'
     
-    async def stop_bot(self):
-        """Остановка рассылки"""
-        self.is_active = False
-        for task in self.scheduled_tasks:
-            task.cancel()
-        self.scheduled_tasks.clear()
-        logger.info("Рассылка остановлена")
+    async def start_mass_sending(self, event, user_id):
+        """Запуск массовой рассылки"""
+        try:
+            client = user_sessions[user_id]
+            message_text = user_data[user_id]['selected_draft']
+            db_file = f'users_{user_id}.csv'
+            sent_file = f'sent_{user_id}.csv'
+            
+            if not os.path.exists(db_file):
+                await event.respond("❌ База пользователей не найдена")
+                return
+            
+            df = pd.read_csv(db_file)
+            
+            # Фильтруем уже отправленных
+            if os.path.exists(sent_file):
+                sent_df = pd.read_csv(sent_file)
+                sent_user_ids = set(sent_df['user_id'].tolist())
+                users_to_send = df[~df['user_id'].isin(sent_user_ids)]
+            else:
+                users_to_send = df
+                sent_user_ids = set()
+            
+            total_to_send = len(users_to_send)
+            
+            if total_to_send == 0:
+                await event.respond("❌ Нет новых пользователей для отправки")
+                return
+            
+            await event.respond(f"🚀 Начинаем рассылку для {total_to_send} пользователей...")
+            
+            success_count = 0
+            failed_count = 0
+            sent_history = []
+            
+            for index, row in users_to_send.iterrows():
+                username = row['username']
+                
+                try:
+                    result = await client.send_message(username, message_text)
+                    
+                    if result:
+                        success_count += 1
+                        sent_history.append({
+                            'user_id': row['user_id'],
+                            'username': username,
+                            'sent_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'message': message_text[:100]
+                        })
+                        
+                        # Отправляем лог в чат
+                        if success_count % 10 == 0:  # Каждые 10 успешных отправок
+                            await event.respond(f"✅ Отправлено {success_count}/{total_to_send}")
+                        else:
+                            await event.respond(f"✅ Отправлено @{username}")
+                    
+                    else:
+                        failed_count += 1
+                        await event.respond(f"❌ Ошибка отправки @{username}")
+                    
+                    # Задержка
+                    delay = random.randint(30, 90)
+                    await asyncio.sleep(delay)
+                
+                except Exception as e:
+                    failed_count += 1
+                    error_msg = str(e)
+                    await event.respond(f"❌ Ошибка @{username}: {error_msg[:50]}...")
+                    
+                    if "FLOOD_WAIT" in error_msg:
+                        try:
+                            wait_time = int(error_msg.split()[-1])
+                            await asyncio.sleep(wait_time)
+                        except:
+                            await asyncio.sleep(60)
+                    else:
+                        await asyncio.sleep(30)
+            
+            # Сохраняем историю отправки
+            if sent_history:
+                new_sent_df = pd.DataFrame(sent_history)
+                if os.path.exists(sent_file):
+                    existing_sent_df = pd.read_csv(sent_file)
+                    updated_sent_df = pd.concat([existing_sent_df, new_sent_df])
+                    updated_sent_df.to_csv(sent_file, index=False)
+                else:
+                    new_sent_df.to_csv(sent_file, index=False)
+            
+            # Итоговый отчет
+            await event.respond(
+                f"📊 **Рассылка завершена!**\n\n"
+                f"✅ Успешно: {success_count}\n"
+                f"❌ Ошибок: {failed_count}\n"
+                f"📈 Всего обработано: {success_count + failed_count}"
+            )
+            
+            user_states[user_id] = 'main_menu'
+        
+        except Exception as e:
+            await event.respond(f"💥 Критическая ошибка при рассылке: {str(e)}")
+            user_states[user_id] = 'main_menu'
+
+# Запуск бота
+if __name__ == '__main__':
+    # Замените на токен вашего бота
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
     
-    async def run(self):
-        """Запуск клиента"""
-        await self.client.start(phone=PHONE_NUMBER)
-        self.setup_handlers()
-        
-        me = await self.client.get_me()
-        logger.info(f"Работаем от имени: {me.first_name} (ID: {me.id})")
-        
-        await self.client.send_message(me.id, "✅ Рассыльщик BaroHolog запущен! Используйте /start для инструкций")
-        
-        await self.client.run_until_disconnected()
-
-# Запуск
-async def main():
-    sender = BaroHologSender(API_ID, API_HASH)
-    await sender.run()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # API данные для бота (не для пользовательских аккаунтов)
+    api_id = 1234567  # Замените на ваш API ID
+    api_hash = 'your_api_hash_here'  # Замените на ваш API Hash
+    
+    bot = MassSenderBot(BOT_TOKEN)
+    
+    try:
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        print("Бот остановлен")
